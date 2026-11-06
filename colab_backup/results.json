@@ -1,0 +1,35 @@
+[
+  {
+    "epochs_logged": 200,
+    "best": {
+      "epoch": 107,
+      "overall": 71.840355,
+      "open": 61.666668,
+      "closed": 78.597786
+    },
+    "last": {
+      "epoch": 199,
+      "overall": 68.51,
+      "open": 58.33,
+      "closed": 75.28
+    },
+    "dataset": "rad",
+    "encoder": "RN50",
+    "run": 0,
+    "config": "repro_rad.run0.yaml",
+    "full_protocol": true,
+    "paper_open_closed_overall": [
+      60.1,
+      80.0,
+      72.1
+    ],
+    "output_dir": "/content/qcr_repro/PubMedCLIP/QCR_PubMedCLIP/output/qcr/pubmedclipRN50_ae/roco/VQARAD/QCR.CLIPRN50.AE.ROCO.VQARAD.16batchsize.200epoch.withTFIDF.nondeterministic.run0",
+    "_note": "Rebuilt locally from the saved outputs of notebooks/PubMedCLIP_QCR_Reproduction.ipynb (not copied from Colab). best = exact log values (training cell, epoch 107); last = 2-decimal values printed by the wait cell, because the epoch-199 log line was not saved locally.",
+    "epoch_cutoffs": [
+      {"epochs": 25, "best_epoch": 23, "open": 53.04, "closed": 79.26, "overall": 68.74, "last_overall": 65.63},
+      {"epochs": 50, "best_epoch": 47, "open": 57.78, "closed": 80.07, "overall": 71.18, "last_overall": 69.84},
+      {"epochs": 100, "best_epoch": 47, "open": 57.78, "closed": 80.07, "overall": 71.18, "last_overall": 66.74},
+      {"epochs": 200, "best_epoch": 107, "open": 61.67, "closed": 78.60, "overall": 71.84, "last_overall": 68.51}
+    ]
+  }
+]
