@@ -4,8 +4,12 @@
 |---|---|---|
 | **[PubMedCLIP_QCR_Reproduction.ipynb](notebooks/PubMedCLIP_QCR_Reproduction.ipynb)** | 공식 QCR 코드 + 저자 가중치·config | **재현** |
 | **[BiomedCLIP_METER_Approximation.ipynb](notebooks/BiomedCLIP_METER_Approximation.ipynb)** | 공개 224 가중치 + METER 재구현 + M3AE 설정 | **근사**(동일 재현 불가) |
+| **[BioMedVITAL_QLoRA_Approximation.ipynb](notebooks/BioMedVITAL_QLoRA_Approximation.ipynb)** | 공개 instruction-tuned 13B + QLoRA fine-tuning + LLaVA-Med v1 학습·저자 추론 코드 방식 | **근사**(fine-tuned 가중치·코드 비공개), A100 필요 |
 
-각 노트북 하나만 Colab에 업로드하고 GPU 런타임에서 위부터 실행합니다. 필요한 코드는 노트북 안에 다 들어 있습니다. 두 노트북은 같은 VQA-RAD/SLAKE 파일을 씁니다.
+각 노트북 하나만 Colab에 업로드하고 GPU 런타임에서 위부터 실행합니다. 필요한 코드는 노트북 안에 다 들어 있습니다.
+PubMedCLIP·BiomedCLIP 노트북은 같은 VQA-RAD(MEVF 3064/451)/SLAKE 파일을 씁니다.
+BioMed-VITAL 노트북은 논문대로 VQA-RAD 원본 split(같은 파일에서 `phrase_type == "frame"` 질문을 뺀 1,797/451)을 씁니다. test 451은 두 split이 같습니다.
+노트북은 `build_*_notebook.py`로 만들고, BioMed-VITAL 모듈의 CPU 확인은 `tests/biomed_vital_cpu_smoke.py`입니다(작은 랜덤 모델, 실제 토크나이저·VQA-RAD JSON).
 
 # PubMedCLIP (QCR) 재현
 
