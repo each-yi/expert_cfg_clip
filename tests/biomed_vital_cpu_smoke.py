@@ -109,3 +109,71 @@ assert again == first
 backup = bv.backup_text(work)
 assert backup.startswith(bv.BACKUP_BEGIN) and backup.endswith(bv.BACKUP_END)
 print('backup', len(backup), 'chars; OK')
+
+# ---- saved models: every epoch exported; load_model puts the exact weights back ----
+for run_name, epochs in ((f'rad_lr{chosen}', (1, 2)), (other, (1,))):
+    for e in epochs:
+        d = work / 'runs' / run_name / f'epoch{e}'
+        assert all((d / f).is_file() for f in bv.MODEL_FILES), d
+        assert json.loads((d / 'meta.json').read_text(encoding='utf-8'))['epoch'] == e
+final = {n: p.detach().clone() for n, p in bv.trainable_named(c)}
+bv.reset_trainable(c, 123)
+assert not all(torch.equal(p.detach(), final[n]) for n, p in bv.trainable_named(c))
+meta = bv.load_model(c, work / 'runs' / f'rad_lr{chosen}' / 'epoch2')
+assert meta['base_revision'] == bv.MODEL[1] and meta['lr'] == s1['lr_selection']['chosen_lr']
+assert all(torch.equal(p.detach(), final[n]) for n, p in bv.trainable_named(c)), 'load_model did not restore the weights'
+
+
+# ---- Hub copy (fake API): uploads land under <prefix>/, a fresh work_dir resumes without retraining ----
+class FakeApi:
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def create_commit(self, repo, ops, commit_message, repo_type):
+        for op in ops:
+            dst = self.root / op.path_in_repo
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(op.path_or_fileobj, dst)
+
+    def list_repo_files(self, repo, repo_type):
+        return [p.relative_to(self.root).as_posix() for p in self.root.rglob('*') if p.is_file()]
+
+
+import huggingface_hub  # noqa: E402
+remote = work / 'fake_hub'
+
+
+def fake_download(repo, filename, repo_type, local_dir):
+    dst = Path(local_dir) / filename
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(remote / filename, dst)
+    return str(dst)
+
+
+huggingface_hub.hf_hub_download = fake_download
+orig_init = bv.Hub.__init__
+bv.Hub.__init__ = lambda self, repo, prefix='', upload_state=True, log=print: (
+    orig_init(self, repo, prefix, upload_state, log), setattr(self, 'api', FakeApi(remote)))[0]
+hub_spec = {**spec, 'hub_repo': 'me/fake', 'hub_prefix': 'bv'}
+assert bv.hub_sync(hub_spec, log=lambda *_: None)
+on_hub = {p.relative_to(remote / 'bv').as_posix() for p in (remote / 'bv').rglob('*') if p.is_file()}
+assert set(bv.hub_files(work)) == on_hub and f'runs/rad_lr{chosen}/epoch2/adapter_model.safetensors' in on_hub
+work2 = work.parent / (work.name + '_restored')
+if work2.exists():
+    shutil.rmtree(work2)
+restored = bv.make_hub({**hub_spec, 'work_dir': str(work2)}, log=lambda *_: None).restore(work2)
+assert f'runs/rad_lr{chosen}/state.pt' in restored and not any('epoch' in r and 'safetensors' in r for r in restored)
+trained = []
+s3 = bv.run_pipeline({**hub_spec, 'work_dir': str(work2)}, components=c, log=trained.append)
+assert s3["results"] == s1["results"] and not any("s/step" in str(m) for m in trained), 'restored run retrained'
+print('saved models + hub copy OK')
+work3 = work.parent / (work.name + '_live')
+if work3.exists():
+    shutil.rmtree(work3)
+s4 = bv.run_pipeline({**spec, 'work_dir': str(work3), 'hub_repo': 'me/fake', 'hub_prefix': 'live'}, components=c, log=lambda *_: None)
+live = {p.relative_to(remote / 'live').as_posix() for p in (remote / 'live').rglob('*') if p.is_file()}
+c4 = bv.lr_tag(s4['lr_selection']['chosen_lr'])
+need = {f'runs/rad_lr{c4}/epoch{e}/{f}' for e in (1, 2) for f in bv.MODEL_FILES} | {f'runs/rad_lr{c4}/state.pt', 'summary.json',
+        'results/lr_selection.json', f'results/rad_lr{c4}_epoch2_test_paper.json'}
+assert need <= live, need - live
+print('live epoch uploads OK')

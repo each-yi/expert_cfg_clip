@@ -53,7 +53,18 @@ Open/Closed는 모든 채점에서 정답 `answer_type` 기준입니다. Overall
 
 학습은 **백그라운드 프로세스**로 돕니다. 셀을 중단하거나 출력이 끊겨도 계속됩니다.
 optimizer step 10번마다와 epoch마다 상태를 저장하므로, 프로세스가 죽으면 **같은 런타임에서** 5-1 셀을 다시 실행해 이어서 학습합니다.
-런타임이 사라지면 디스크도 사라지므로, 끝나면 7번 셀(base64 백업)을 꼭 실행하고 노트북을 저장하세요.
+
+**저장 (체크포인트·모델)**: VS Code에서 Colab 커널을 쓰면 파일은 PC가 아니라 Colab 런타임 디스크(`/content`)에 생기고,
+런타임이 끝나면 사라집니다. 그래서 epoch마다 아래 파일을 **본인 HF 계정의 비공개 model repo**에 자동으로 올리고,
+PC에서는 8번 셀의 명령으로 받습니다.
+
+| 파일 | 내용 | 크기 |
+|---|---|---|
+| `runs/<run>/epoch<k>/` | fine-tuned 모델: LoRA adapter(`adapter_model.safetensors`, peft 형식) + `mm_projector.safetensors` + `meta.json` | 약 2GB |
+| `runs/<run>/state.pt` | 이어서 학습용 체크포인트(LoRA·projector·optimizer·scheduler·난수 상태) | 약 6GB |
+| `results/*.json`, `summary.json`, `train.log` | 결과(질문별 예측 포함)와 로그 | 작음 |
+
+새 런타임에서 같은 `HUB_REPO`로 5-1을 실행하면 Hub에서 체크포인트와 결과를 먼저 받아 **끝난 단계는 건너뛰고 이어서** 학습합니다.
 ''')
 add('markdown', '## 1. 환경 설치\n\n버전을 고정합니다. 설치 후 런타임을 다시 시작하라는 메시지가 나오면 다시 시작한 뒤 2번 셀부터 실행하세요.')
 add('code', '''
@@ -88,6 +99,9 @@ add('markdown', '''
 - `TEST_GREEDY`: test를 저자 방식(샘플링) 외에 greedy로도 한 번 더 평가합니다(재현성 확인용).
 - `MICRO_BATCH`: GPU에 한 번에 올리는 개수. 전역 batch 64는 gradient accumulation으로 유지됩니다. 메모리가 부족하면 2로 줄이세요.
 - `QUICK_CHECK`: `True`면 데이터 일부(train 128개)로 전체 흐름만 확인합니다(약 20~30분, 결과는 의미 없음). 별도 폴더에 저장됩니다.
+- `HUB_REPO`: 체크포인트·모델을 올릴 **비공개** HF model repo(`본인아이디/이름`). 없으면 다음 셀이 비공개로 만듭니다. `None`이면 Colab 디스크에만 저장됩니다.
+- `HUB_STATE`: `True`면 `state.pt`(약 6GB)도 epoch마다 올립니다(새 런타임에서 이어서 학습하려면 필요).
+  같은 경로에 덮어써도 HF는 이전 버전을 기록에 남기므로 전체 실행에서 repo가 수십 GB까지 커질 수 있습니다. 모델만 필요하면 `False`.
 ''')
 add('code', '''
 import json
@@ -98,6 +112,8 @@ ZERO_SHOT = []
 TEST_GREEDY = True
 MICRO_BATCH = 4
 QUICK_CHECK = False
+HUB_REPO = None  # 예: 'my-hf-id/biomed-vital-qlora'
+HUB_STATE = True
 CACHE = Path('/content/hf_cache')
 WORK = Path('/content/biomed_vital_quick' if QUICK_CHECK else '/content/biomed_vital')
 WORK.mkdir(parents=True, exist_ok=True)
@@ -106,7 +122,36 @@ SPEC = {'work_dir': str(WORK), 'cache_dir': str(CACHE), 'datasets': DATASETS, 'z
         'chosen_lr': CHOSEN_LR, 'test_greedy': TEST_GREEDY, 'overrides': {'lrs': LRS, 'micro_batch': MICRO_BATCH}}
 if QUICK_CHECK:
     SPEC['limit'] = {'train': 128, 'validation': 24, 'test': 24}
+if HUB_REPO:  # Hub 안에서도 WORK 폴더 이름(biomed_vital / biomed_vital_quick) 아래에 저장
+    SPEC.update(hub_repo=HUB_REPO, hub_prefix=WORK.name, hub_state=HUB_STATE)
+else:
+    print('경고: HUB_REPO가 없어서 모델·체크포인트는 Colab 디스크에만 남고 런타임이 끝나면 사라집니다.')
 print(json.dumps(SPEC, indent=1))
+''')
+add('markdown', '''
+### 3-1. Hugging Face 로그인 (HUB_REPO를 쓸 때)
+
+**write** 권한 토큰이 필요합니다(https://huggingface.co/settings/tokens). Colab 보안 비밀(`HF_TOKEN`)이 있으면 그것을 쓰고,
+없으면 입력창이 뜹니다. 토큰은 환경변수로만 학습 프로세스에 전달되고 `spec.json`이나 출력에는 남지 않습니다.
+''')
+add('code', '''
+import os, getpass
+from huggingface_hub import HfApi
+if HUB_REPO:
+    if not os.environ.get('HF_TOKEN'):
+        try:
+            from google.colab import userdata
+            os.environ['HF_TOKEN'] = userdata.get('HF_TOKEN')
+        except Exception:
+            os.environ['HF_TOKEN'] = getpass.getpass('HF write token: ').strip()
+    api = HfApi()
+    print('logged in as', api.whoami()['name'])
+    url = api.create_repo(HUB_REPO, repo_type='model', private=True, exist_ok=True)
+    info = api.model_info(HUB_REPO)
+    assert info.private, f'{HUB_REPO} is PUBLIC - use a private repo'
+    print('hub repo (private):', url)
+else:
+    print('HUB_REPO = None: Hub 저장 안 함')
 ''')
 add('markdown', '''
 ## 4. 데이터 확인
@@ -135,6 +180,8 @@ add('markdown', '''
 
 처음에는 약 52GB 모델을 받고 4bit로 올리는 데 20~30분 걸립니다(로그에 진행 표시).
 이미 실행 중이면 새로 띄우지 않고, 끝난 단계는 건너뜁니다. 멈추려면 `bv.stop_trainer(WORK)`.
+`HUB_REPO`가 있으면 모델을 받기 전에 Hub에 있는 체크포인트·결과를 먼저 내려받고(`hub: restored ...`),
+epoch이 끝날 때마다 올린 기록이 로그에 `hub: ...`로 찍힙니다(epoch당 1~3분). 업로드가 실패해도 학습은 계속되고, 8번 셀로 다시 올릴 수 있습니다.
 ''')
 add('code', '''
 bv.start_trainer(SPEC)
@@ -201,6 +248,38 @@ add('code', '''
 backup = bv.backup_text(WORK)
 print(f'{len(backup) / 1e6:.2f} MB of text')
 print(backup)
+''')
+add('markdown', '''
+## 8. 체크포인트·모델을 PC로 받기 (Hugging Face Hub)
+
+### 8-1. Hub에 빠진 파일 다시 올리기 (Colab에서)
+
+학습 중 업로드가 실패했거나 마지막 로그까지 올리고 싶을 때 실행합니다. 이미 같은 내용이 있는 파일은 다시 보내지 않습니다.
+''')
+add('code', '''
+assert HUB_REPO, '3번 셀에서 HUB_REPO를 지정하세요'
+local = bv.hub_files(WORK, HUB_STATE)
+print(len(local), 'files on the Colab disk')
+assert bv.hub_sync(SPEC), 'upload failed - 로그를 보고 다시 실행하세요'
+remote = [f for f in HfApi().list_repo_files(HUB_REPO) if f.startswith(WORK.name + '/')]
+missing = sorted(set(local) - {f[len(WORK.name) + 1:] for f in remote})
+print(len(remote), 'files on the Hub under', WORK.name + '/', '| missing:', missing or 'none')
+for f in sorted(remote):
+    if f.endswith(('adapter_model.safetensors', 'state.pt')):
+        print(' ', f)
+''')
+add('markdown', '''
+### 8-2. PC에서 받기 (VS Code 터미널, Colab 커널이 아니라 로컬에서 실행)
+
+```
+pip install -U huggingface_hub
+hf auth login
+hf download <HUB_REPO> --local-dir colab_backup/biomed_vital_hub --exclude "*state.pt"
+```
+
+- 모델만 받습니다(run·epoch마다 약 2GB). 이어서 학습할 체크포인트(`state.pt`, 약 6GB)까지 받으려면 `--exclude` 부분을 지우세요.
+- 특정 run만: `--include "biomed_vital/runs/rad_lr2e-4/epoch3/*" "biomed_vital/results/*"`
+- 받은 모델은 Colab에서 모델을 올린 뒤(`c = bv.build_components(...)`) `bv.load_model(c, '<폴더>/epoch3')`로 다시 넣어 평가할 수 있습니다.
 ''')
 
 notebook = {'cells': cells, 'metadata': {'accelerator': 'GPU', 'colab': {'name': 'BioMedVITAL_QLoRA_Approximation.ipynb', 'gpuType': 'A100', 'provenance': []},

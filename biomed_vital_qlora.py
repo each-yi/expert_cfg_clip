@@ -479,14 +479,124 @@ def _write_json(path, obj):
     tmp.replace(path)
 
 
-class Run:
-    """One fine-tuning run (dataset, lr) with a fixed cfg['epochs'] cosine schedule; resumable at optimizer steps."""
+# ---- saved models and Hugging Face Hub copy -------------------------------------------------------------------
+# The Colab disk disappears with the runtime and a Colab kernel inside VS Code cannot download files to the PC, so
+# everything worth keeping is also pushed to a private HF model repo (token: HF_TOKEN env) and pulled to the PC there.
+MODEL_FILES = ('adapter_model.safetensors', 'adapter_config.json', 'mm_projector.safetensors', 'meta.json')
 
-    def __init__(self, c, cfg, dataset, lr, splits, pixels, out_dir, log=print):
+
+def export_model(c, out_dir, meta):
+    """Fine-tuned model = LoRA adapter (peft format) + projector; the 4-bit base comes from MODEL at load time."""
+    from safetensors.torch import save_file
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    c.model.save_pretrained(str(out))
+    save_file({k: v.detach().cpu().contiguous() for k, v in c.projector.state_dict().items()}, str(out / 'mm_projector.safetensors'))
+    _write_json(out / 'meta.json', {'base_model': MODEL[0], 'base_revision': MODEL[1], 'vision_tower': VISION[0],
+                                    'vision_revision': VISION[1], **meta})
+
+
+def load_model(c, model_dir):
+    """Put a model saved by export_model into the components (for re-evaluation without retraining)."""
+    import torch
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+    d = Path(model_dir)
+    result = set_peft_model_state_dict(c.model, load_file(str(d / 'adapter_model.safetensors')))
+    if getattr(result, 'unexpected_keys', None):
+        raise ValueError(f'adapter keys do not match the model: {result.unexpected_keys[:5]}')
+    c.projector.load_state_dict({k: v.to(c.device, torch.float32) for k, v in load_file(str(d / 'mm_projector.safetensors')).items()})
+    return json.loads((d / 'meta.json').read_text(encoding='utf-8'))
+
+
+class Hub:
+    """Copies work_dir files to <repo>/<prefix>/ (same relative paths) and restores missing ones on a new runtime."""
+
+    def __init__(self, repo_id, prefix='', upload_state=True, log=print):
+        from huggingface_hub import HfApi
+        self.api, self.repo, self.prefix, self.upload_state, self.log = HfApi(), repo_id, prefix.strip('/'), upload_state, log
+
+    def remote(self, rel):
+        return f'{self.prefix}/{rel}' if self.prefix else rel
+
+    def upload(self, work, rels, message):
+        """One commit; failures are logged, never stop training (hub_sync retries everything later)."""
+        from huggingface_hub import CommitOperationAdd
+        work = Path(work)
+        rels = [r for r in dict.fromkeys(rels) if (work / r).is_file() and (self.upload_state or not r.endswith('state.pt'))]
+        if not rels:
+            return True
+        for attempt in range(1, 4):
+            try:
+                t0 = time.time()
+                ops = [CommitOperationAdd(self.remote(r), str(work / r)) for r in rels]
+                self.api.create_commit(self.repo, ops, commit_message=message, repo_type='model')
+                mb = sum((work / r).stat().st_size for r in rels) / 1e6
+                self.log(f'hub: {message} ({len(rels)} files, {mb:.0f} MB, {time.time() - t0:.0f}s)')
+                return True
+            except Exception as e:  # network / rate limit: retry, then leave it to hub_sync
+                self.log(f'hub upload failed ({attempt}/3, {message}): {e!r}')
+                time.sleep(30 * attempt)
+        return False
+
+    def restore(self, work):
+        """Download results, run progress and resume states that this runtime does not have (new Colab runtime)."""
+        from huggingface_hub import hf_hub_download
+        work = Path(work)
+        files = self.api.list_repo_files(self.repo, repo_type='model')
+        head = f'{self.prefix}/' if self.prefix else ''
+        wanted = [f[len(head):] for f in files if f.startswith(head)]
+        wanted = [r for r in wanted if re.fullmatch(r'results/[^/]+\.json|runs/[^/]+/(progress\.json|state\.pt)', r)
+                  and not (work / r).exists()]
+        tmp = work / '.hub_tmp'
+        for r in wanted:
+            path = Path(hf_hub_download(self.repo, self.remote(r), repo_type='model', local_dir=str(tmp)))
+            (work / r).parent.mkdir(parents=True, exist_ok=True)
+            path.replace(work / r)
+            self.log(f'hub: restored {r}')
+        if tmp.exists():
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        return wanted
+
+
+def hub_files(work_dir, include_state=True):
+    """Every file hub_sync keeps on the Hub (relative to work_dir)."""
+    work = Path(work_dir)
+    pats = ['summary.json', 'spec.json', 'train.log', 'results/*.json', 'runs/*/progress.json', 'runs/*/epoch*/*']
+    pats += ['runs/*/state.pt'] if include_state else []
+    return sorted({p.relative_to(work).as_posix() for pat in pats for p in work.glob(pat) if p.is_file()})
+
+
+def make_hub(spec, log=print):
+    if not spec.get('hub_repo'):
+        return None
+    return Hub(spec['hub_repo'], spec.get('hub_prefix', Path(spec['work_dir']).name), spec.get('hub_state', True), log=log)
+
+
+def hub_sync(spec, log=print):
+    """Upload everything (again); files already on the Hub with the same content are not re-sent."""
+    hub = make_hub(spec, log=log)
+    if hub is None:
+        raise ValueError('spec has no hub_repo')
+    work = Path(spec['work_dir'])
+    rels = hub_files(work, hub.upload_state)
+    for name in rels:  # one commit per large file keeps each commit retryable
+        if name.endswith(('state.pt', 'adapter_model.safetensors')):
+            hub.upload(work, [name], f'sync {name}')
+    return hub.upload(work, [r for r in rels if not r.endswith(('state.pt', 'adapter_model.safetensors'))], 'sync small files')
+
+
+class Run:
+    """One fine-tuning run (dataset, lr) with a fixed cfg['epochs'] cosine schedule; resumable at optimizer steps.
+    After every epoch the model is exported to <out_dir>/epoch<k>/ and, with a hub, uploaded with the resume state."""
+
+    def __init__(self, c, cfg, dataset, lr, splits, pixels, out_dir, log=print, hub=None):
         import torch
         from transformers import get_cosine_schedule_with_warmup
         self.c, self.cfg, self.dataset, self.lr, self.splits, self.pixels, self.log = c, cfg, dataset, lr, splits, pixels, log
-        self.out = Path(out_dir)
+        self.out, self.hub = Path(out_dir), hub
+        self.work = self.out.parent.parent  # <work>/runs/<name>
         self.examples = []
         for r in splits['train']:
             ids, labels = build_train_example(c.tokenizer, r['question'], r['answer'], c.n_patches, cfg['max_length'])
@@ -574,11 +684,21 @@ class Run:
             self.state['epoch'] += 1
             self.state['step_in_epoch'] = 0
             record = {'epoch': self.state['epoch'], 'mean_loss': sum(self.state['losses'][-self.steps_per_epoch:]) / self.steps_per_epoch}
+            model_dir = self.out / f'epoch{self.state["epoch"]}'
+            export_model(c, model_dir, {'dataset': self.dataset, 'lr': self.lr, 'epoch': self.state['epoch'],
+                                        'schedule_epochs': cfg['epochs'], 'global_step': self.state['global_step'],
+                                        'mean_loss': record['mean_loss'], 'config': cfg})
+            self.log(f'saved model {model_dir}')
             if on_epoch_end:
                 record.update(on_epoch_end(self, self.state['epoch']) or {})
             self.state['history'].append(record)
             self.save()
             self.log(json.dumps({'run': self.out.name, **record}))
+            if self.hub:
+                rel = self.out.relative_to(self.work).as_posix()
+                self.hub.upload(self.work, [f'{rel}/epoch{self.state["epoch"]}/{f}' for f in MODEL_FILES],
+                                f'{self.out.name} epoch {self.state["epoch"]} model')
+                self.hub.upload(self.work, [f'{rel}/state.pt', f'{rel}/progress.json'], f'{self.out.name} epoch {self.state["epoch"]} state')
 
 
 # ---- pipeline --------------------------------------------------------------------------------------------------
@@ -600,7 +720,7 @@ def _free(run):
         torch.cuda.empty_cache()
 
 
-def evaluate_split(c, cfg, splits, pixels, split, mode, results_dir, name, seed=0, log=print):
+def evaluate_split(c, cfg, splits, pixels, split, mode, results_dir, name, seed=0, log=print, hub=None):
     path = Path(results_dir) / f'{name}.json'
     if path.exists():
         return json.loads(path.read_text(encoding='utf-8'))['metrics']
@@ -612,6 +732,8 @@ def evaluate_split(c, cfg, splits, pixels, split, mode, results_dir, name, seed=
     metrics.update(split=split, decoding=mode, questions=len(rows))
     _write_json(path, {'metrics': metrics, 'per_question': per_question})
     log(f'RESULT {name} ' + json.dumps({'paper': metrics['paper'], 'unified': metrics['unified']}))
+    if hub:
+        hub.upload(path.parent.parent, [f'results/{name}.json'], f'result {name}')
     return metrics
 
 
@@ -621,6 +743,10 @@ def run_pipeline(spec, components=None, log=print):
     cfg = config_for(spec.get('overrides'))
     work, cache = Path(spec['work_dir']), Path(spec['cache_dir'])
     res = work / 'results'
+    hub = make_hub(spec, log=log)
+    if hub:  # before the 52 GB download: a bad repo/token fails fast, and a new runtime resumes from the Hub copy
+        restored = hub.restore(work)
+        log(f'hub {hub.repo}/{hub.prefix}: restored {len(restored)} files')
     c = components or build_components(cfg, cache)
     data = {d: load_data(d, work, cache, cfg, rad_dir=spec.get('rad_dir')) for d in ('rad', 'slake') if d in spec['datasets']}
     if spec.get('limit'):  # smoke tests only
@@ -633,18 +759,18 @@ def run_pipeline(spec, components=None, log=print):
 
     for d in spec.get('zero_shot', []):
         if d in data:
-            evaluate_split(c, cfg, data[d], pixels[d], 'test', 'paper', res, f'zeroshot_{d}_test_paper', log=log)
+            evaluate_split(c, cfg, data[d], pixels[d], 'test', 'paper', res, f'zeroshot_{d}_test_paper', log=log, hub=hub)
 
     if 'rad' in data:
         rad = data['rad']
         val_hook = lambda run, epoch: {'validation': evaluate_split(
-            c, cfg, rad, pixels['rad'], 'validation', 'greedy', res, f'rad_lr{lr_tag(run.lr)}_epoch{epoch}_val_greedy', log=log)['unified']}
+            c, cfg, rad, pixels['rad'], 'validation', 'greedy', res, f'rad_lr{lr_tag(run.lr)}_epoch{epoch}_val_greedy', log=log, hub=hub)['unified']}
         sweep = {}
         for lr in cfg['lrs']:
-            run = Run(c, cfg, 'rad', lr, rad, pixels['rad'], work / 'runs' / f'rad_lr{lr_tag(lr)}', log=log)
+            run = Run(c, cfg, 'rad', lr, rad, pixels['rad'], work / 'runs' / f'rad_lr{lr_tag(lr)}', log=log, hub=hub)
             run.train_until(cfg['select_epochs'], on_epoch_end=val_hook)
             sweep[lr] = evaluate_split(c, cfg, rad, pixels['rad'], 'validation', 'greedy', res,
-                                       f'rad_lr{lr_tag(lr)}_epoch{cfg["select_epochs"]}_val_greedy', log=log)
+                                       f'rad_lr{lr_tag(lr)}_epoch{cfg["select_epochs"]}_val_greedy', log=log, hub=hub)
             _free(run)
         chosen = spec.get('chosen_lr') or max(cfg['lrs'], key=lambda lr: (selection_key(sweep[lr]), -lr))
         _write_json(res / 'lr_selection.json', {'chosen_lr': chosen, 'manual': bool(spec.get('chosen_lr')),
@@ -652,10 +778,12 @@ def run_pipeline(spec, components=None, log=print):
                                                 'validation_after_epochs': cfg['select_epochs'],
                                                 'sweep': {lr_tag(lr): sweep[lr] for lr in cfg['lrs']}})
         log(f'chosen lr {chosen:g}')
-        run = Run(c, cfg, 'rad', chosen, rad, pixels['rad'], work / 'runs' / f'rad_lr{lr_tag(chosen)}', log=log)
+        if hub:
+            hub.upload(work, ['results/lr_selection.json'], 'lr selection')
+        run = Run(c, cfg, 'rad', chosen, rad, pixels['rad'], work / 'runs' / f'rad_lr{lr_tag(chosen)}', log=log, hub=hub)
         run.train_until(cfg['epochs'], on_epoch_end=val_hook)
         for mode in test_modes:
-            evaluate_split(c, cfg, rad, pixels['rad'], 'test', mode, res, f'rad_lr{lr_tag(chosen)}_epoch{cfg["epochs"]}_test_{mode}', log=log)
+            evaluate_split(c, cfg, rad, pixels['rad'], 'test', mode, res, f'rad_lr{lr_tag(chosen)}_epoch{cfg["epochs"]}_test_{mode}', log=log, hub=hub)
         _free(run)
     else:
         chosen = spec.get('chosen_lr')
@@ -667,14 +795,16 @@ def run_pipeline(spec, components=None, log=print):
         if chosen is None:
             raise ValueError('SLAKE needs chosen_lr (run VQA-RAD first or set CHOSEN_LR)')
         slake = data['slake']
-        run = Run(c, cfg, 'slake', chosen, slake, pixels['slake'], work / 'runs' / f'slake_lr{lr_tag(chosen)}', log=log)
+        run = Run(c, cfg, 'slake', chosen, slake, pixels['slake'], work / 'runs' / f'slake_lr{lr_tag(chosen)}', log=log, hub=hub)
         run.train_until(cfg['epochs'])
         for mode in test_modes:
-            evaluate_split(c, cfg, slake, pixels['slake'], 'test', mode, res, f'slake_lr{lr_tag(chosen)}_epoch{cfg["epochs"]}_test_{mode}', log=log)
+            evaluate_split(c, cfg, slake, pixels['slake'], 'test', mode, res, f'slake_lr{lr_tag(chosen)}_epoch{cfg["epochs"]}_test_{mode}', log=log, hub=hub)
         if spec.get('slake_validation'):
-            evaluate_split(c, cfg, slake, pixels['slake'], 'validation', 'greedy', res, f'slake_lr{lr_tag(chosen)}_epoch{cfg["epochs"]}_val_greedy', log=log)
+            evaluate_split(c, cfg, slake, pixels['slake'], 'validation', 'greedy', res, f'slake_lr{lr_tag(chosen)}_epoch{cfg["epochs"]}_val_greedy', log=log, hub=hub)
     summary = summarize(work)
     _write_json(work / 'summary.json', summary)
+    if hub:
+        hub.upload(work, ['summary.json', 'spec.json', 'train.log'], 'summary')
     return summary
 
 
